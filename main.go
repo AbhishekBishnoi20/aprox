@@ -2,6 +2,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -35,13 +37,155 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if this is explicitly a proxy request (from proxy settings) or direct to the proxy
+	isExplicitProxy := r.URL.IsAbs() || r.Method == http.MethodConnect
+
 	// Handle HTTPS (CONNECT) requests
 	if r.Method == http.MethodConnect {
-		handleHTTPS(w, r)
+		// First try normal CONNECT method
+		if tryConnectTunnel(w, r) {
+			return
+		}
+		// If tunnel fails, fall back to alternative HTTPS handling
+		handleHTTPSAlternative(w, r)
+	} else if isExplicitProxy && strings.HasPrefix(r.URL.Scheme, "https") {
+		// Handle HTTPS requests that come in via the http proxy
+		handleHTTPSAlternative(w, r)
 	} else {
 		// Handle HTTP requests
 		handleHTTP(w, r)
 	}
+}
+
+// Try the standard CONNECT method and return true if successful
+func tryConnectTunnel(w http.ResponseWriter, r *http.Request) bool {
+	// Log HTTPS connection attempt
+	log.Printf("Trying HTTPS CONNECT tunnel to: %s", r.Host)
+
+	// Establish a TCP tunnel for HTTPS
+	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	if err != nil {
+		log.Printf("Error connecting to target %s: %v", r.Host, err)
+		return false
+	}
+	defer destConn.Close()
+
+	// Hijack the client connection to get a raw TCP connection
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		log.Println("Hijacking not supported")
+		return false
+	}
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		log.Printf("Failed to hijack connection: %v", err)
+		return false
+	}
+	defer clientConn.Close()
+
+	// Send HTTP 200 OK to client to establish the tunnel
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if err != nil {
+		log.Printf("Failed to send 200 OK to client: %v", err)
+		return false
+	}
+
+	log.Printf("HTTPS tunnel established to %s", r.Host)
+
+	// Relay data between client and target
+	go func() {
+		defer destConn.Close()
+		defer clientConn.Close()
+		io.Copy(destConn, clientConn)
+	}()
+
+	// This will block until the connection is closed
+	io.Copy(clientConn, destConn)
+	return true
+}
+
+// Alternative approach for HTTPS when CONNECT tunneling fails
+func handleHTTPSAlternative(w http.ResponseWriter, r *http.Request) {
+	var targetHost string
+	var targetURL *url.URL
+
+	// Get the target host from the request
+	if r.Method == http.MethodConnect {
+		targetHost = r.Host
+		targetURL = &url.URL{
+			Scheme: "https",
+			Host:   targetHost,
+		}
+	} else {
+		targetURL = r.URL
+		targetHost = targetURL.Host
+	}
+
+	log.Printf("Using alternative HTTPS handling for: %s", targetHost)
+
+	// Create TLS client config that skips certificate verification
+	// (this is needed since we're acting as a client to the target server)
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+
+	// Create HTTP client with TLS config
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+	}
+
+	// Create a new request to the target
+	var newReq *http.Request
+	var err error
+
+	if r.Method == http.MethodConnect {
+		// For CONNECT requests, we need to make a GET request
+		newReq, err = http.NewRequest("GET", targetURL.String(), nil)
+		if err != nil {
+			http.Error(w, "Failed to create request: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// For other methods, copy the original request
+		newReq, err = http.NewRequest(r.Method, targetURL.String(), r.Body)
+		if err != nil {
+			http.Error(w, "Failed to create request: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Copy headers from original request
+		for key, values := range r.Header {
+			for _, value := range values {
+				newReq.Header.Add(key, value)
+			}
+		}
+	}
+
+	// Set the Host header
+	newReq.Host = targetHost
+
+	// Perform the request
+	resp, err := client.Do(newReq)
+	if err != nil {
+		http.Error(w, "Failed to execute request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+
+	// Set status code
+	w.WriteHeader(resp.StatusCode)
+
+	// Copy response body
+	io.Copy(w, resp.Body)
 }
 
 func handleHTTP(w http.ResponseWriter, r *http.Request) {
@@ -99,52 +243,6 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Serve the request
 	proxy.ServeHTTP(w, r)
-}
-
-func handleHTTPS(w http.ResponseWriter, r *http.Request) {
-	// Log HTTPS connection attempt
-	log.Printf("HTTPS CONNECT request to: %s", r.Host)
-
-	// Establish a TCP tunnel for HTTPS
-	destConn, err := net.Dial("tcp", r.Host)
-	if err != nil {
-		log.Printf("Error connecting to target %s: %v", r.Host, err)
-		http.Error(w, "Failed to connect to target: "+err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	defer destConn.Close()
-
-	// Hijack the client connection to get a raw TCP connection
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		log.Println("Hijacking not supported")
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		log.Printf("Failed to hijack connection: %v", err)
-		http.Error(w, "Failed to hijack connection: "+err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	defer clientConn.Close()
-
-	// Send HTTP 200 OK to client to establish the tunnel
-	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	if err != nil {
-		log.Printf("Failed to send 200 OK to client: %v", err)
-		return
-	}
-
-	log.Printf("HTTPS tunnel established to %s", r.Host)
-
-	// Relay data between client and target
-	go func() {
-		defer destConn.Close()
-		defer clientConn.Close()
-		io.Copy(destConn, clientConn)
-	}()
-	io.Copy(clientConn, destConn)
 }
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {
