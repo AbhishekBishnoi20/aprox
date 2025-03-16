@@ -39,9 +39,13 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Handle HTTPS requests (CONNECT or absolute HTTPS URLs)
-	if r.Method == http.MethodConnect || (r.URL.IsAbs() && strings.HasPrefix(r.URL.String(), "https://")) {
-		log.Printf("Handling as HTTPS request")
+	if r.Method == http.MethodConnect {
+		log.Printf("Handling as HTTPS CONNECT request")
 		handleHTTPS(w, r)
+		return
+	} else if r.URL.IsAbs() && strings.HasPrefix(r.URL.String(), "https://") {
+		log.Printf("Handling as HTTPS absolute URL request")
+		handleHTTPSAbsoluteURL(w, r)
 		return
 	}
 
@@ -50,24 +54,60 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	handleHTTP(w, r)
 }
 
-// handleHTTPS processes HTTPS requests
+// handleHTTPS processes HTTPS CONNECT requests using connection hijacking
 func handleHTTPS(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Handling CONNECT request to %s", r.Host)
+
+	// Connect to the target server
+	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	if err != nil {
+		log.Printf("Failed to connect to target %s: %v", r.Host, err)
+		http.Error(w, "Cannot connect to target", http.StatusBadGateway)
+		return
+	}
+
+	// Hijack the client connection
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		log.Println("Hijacking not supported")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		log.Printf("Failed to hijack connection: %v", err)
+		destConn.Close()
+		return
+	}
+
+	// Send 200 Connection Established to the client
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if err != nil {
+		log.Printf("Failed to send 200 OK: %v", err)
+		clientConn.Close()
+		destConn.Close()
+		return
+	}
+
+	// Relay data between client and target
+	go func() {
+		defer clientConn.Close()
+		defer destConn.Close()
+		io.Copy(destConn, clientConn)
+	}()
+	io.Copy(clientConn, destConn)
+}
+
+// handleHTTPSAbsoluteURL processes HTTPS requests with absolute URLs
+func handleHTTPSAbsoluteURL(w http.ResponseWriter, r *http.Request) {
 	var targetURL *url.URL
 	var err error
 
-	if r.Method == http.MethodConnect {
-		// CONNECT method: target is in r.Host
-		targetURL = &url.URL{
-			Scheme: "https",
-			Host:   r.Host,
-		}
-	} else {
-		// Absolute URL in request
-		targetURL, err = url.Parse(r.RequestURI)
-		if err != nil {
-			http.Error(w, "Invalid URL: "+err.Error(), http.StatusBadRequest)
-			return
-		}
+	// Parse the absolute URL in request
+	targetURL, err = url.Parse(r.RequestURI)
+	if err != nil {
+		http.Error(w, "Invalid URL: "+err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	log.Printf("Forwarding HTTPS request to: %s", targetURL.String())
